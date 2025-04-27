@@ -1,0 +1,42 @@
+# IDE настройки
+.idea/
+
+# Виртуальное окружение
+.venv/
+venv/
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Логи
+*.log
+
+# Настройки/кэш статического анализа
+.mypy_cache/
+.pytest_cache/
+.dmypy.json
+
+# Настройки редакторов
+.vscode/
+.spyderproject
+.spyderworkspace
+
+# Файлы ОС
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Статика, если это генерируемые файлы
+# (если папка static содержит САМОСТОЯТЕЛЬНО генерируемые файлы - добавить)
+# static/
+
+# Персональные настройки переменных окружения
+.env
+.env.*
+
+# Выводы сборок
+build/
+dist/
+*.egg-info/

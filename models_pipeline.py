@@ -141,7 +141,7 @@ def _pivot_measurements(rows: List[Measurement]) -> pd.DataFrame:
 # 3. Feature engineering helpers
 # ---------------------------------------------------------------------------
 
-_DEF_EARLY_HOURS = 36  # default cutoff for features
+_DEF_EARLY_HOURS = 50  # default cutoff for features
 
 
 def _window_stats(series: pd.Series, minutes: int) -> Tuple[float, float]:
@@ -391,11 +391,14 @@ def predict_abv(
 
     X_vec = pd.DataFrame([build_feature_vector(df, early_hours)])
 
-    abv_pred = float(
-        reg.predict(X_vec, iteration_range=(0, getattr(reg, "best_iteration", None)))
-    )
-    anomaly = bool(det.predict(X_vec)[0] == -1)
+    if hasattr(reg, "best_iteration") and reg.best_iteration is not None:
+        abv_pred = float(
+            reg.predict(X_vec, iteration_range=(0, reg.best_iteration + 1))
+        )
+    else:                        # модель обучена без early-stopping
+        abv_pred = float(reg.predict(X_vec))
 
+    anomaly = bool(det.predict(X_vec)[0] == -1)
     return abv_pred, anomaly
 
 

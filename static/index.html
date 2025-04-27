@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>Brew-IoT dashboard</title>
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+  <style>
+    :root{--bg:#f9fafb;--border:#e5e7eb}
+    body{font-family:system-ui,sans-serif;margin:0;background:var(--bg)}
+    header{display:flex;align-items:center;gap:16px;padding:8px 16px;
+           background:#111827;color:#fff}
+    select{padding:4px 8px;border-radius:4px;font-size:14px}
+    #wrapper{display:grid;grid-template-columns:3fr 1fr;height:calc(100vh - 48px)}
+    #sensorGrid{display:grid;grid-template-rows:repeat(6,1fr); gap:4px;
+                padding:4px;height:100%;overflow:hidden}
+    .chart{border:1px solid var(--border);background:#fff}
+    #gaugeWrap{display:flex;align-items:center;justify-content:center}
+  </style>
+</head>
+<body>
+<header>
+  <h2 style="margin:0;">🛢️ Brew-IoT</h2>
+  <label>Танк
+    <select id="tankSelect"></select>
+  </label>
+</header>
+
+<div id="tips" style="padding:8px;font-size:14px;"></div>
+<div id="wrapper">
+  <div id="sensorGrid">
+    <div id="chart_temperature" class="chart"></div>
+    <div id="chart_sg"          class="chart"></div>
+    <div id="chart_ph"          class="chart"></div>
+    <div id="chart_co2"         class="chart"></div>
+    <div id="chart_pressure"    class="chart"></div>
+    <div id="chart_level"       class="chart"></div>
+  </div>
+  <div id="gaugeWrap"><div id="abvGauge" style="width:100%;height:80%"></div></div>
+</div>
+
+<script>
+/* ---------- константы ---------- */
+const sensors = ["temperature","sg","ph","co2","pressure","level"];
+const labels  = {
+  temperature:"T (°C)", sg:"SG", ph:"pH",
+  co2:"CO₂ (ppm)", pressure:"P (bar)", level:"Level (L)"
+};
+const colors  = {
+  temperature:"#ef4444", sg:"#0ea5e9", ph:"#22c55e",
+  co2:"#f59e0b", pressure:"#6366f1", level:"#8b5cf6"
+};
+
+/* ---------- DOM-элементы ---------- */
+const sel      = document.getElementById("tankSelect");
+const gaugeDiv = document.getElementById("abvGauge");
+
+/* ---------- состояние ---------- */
+let currentTank = 1;
+const firstLoad = {};            // флаги newPlot vs react
+
+/* ---------- вспомогалки ---------- */
+async function j(url){ return (await fetch(url)).json(); }
+
+function plotSensor(sensor, rows){
+  const div = document.getElementById(`chart_${sensor}`);
+  const trace = {
+    x: rows.map(r=>r.timestamp),
+    y: rows.map(r=>r.value),
+    mode:"lines",
+    line:{width:2,color:colors[sensor]},
+    name: labels[sensor],
+    hovertemplate:'%{y:.3f}<extra>'+labels[sensor]+'</extra>'
+  };
+  const layout = {
+    title: labels[sensor],
+    margin:{l:50,r:10,t:25,b:30},
+    xaxis:{type:"date",title:""},
+    yaxis:{title:labels[sensor]}
+  };
+  if(!firstLoad[sensor]){
+    Plotly.newPlot(div,[trace],layout,{displayModeBar:false,responsive:true});
+    firstLoad[sensor]=true;
+  }else{
+    Plotly.react(div,[trace],layout);
+  }
+}
+
+function updateGauge(abv, anomaly){
+  const data=[{
+    type:"indicator",mode:"gauge+number",
+    value:abv,number:{suffix:" %"},
+    title:{text:"Целевой ABV: 4.6<br>ABV прогноз"},
+    gauge:{
+      axis:{range:[0,10]},
+      bar:{color: anomaly? "#e11d48":"#10b981"},
+      steps:[
+        {range:[0,4],color:"#fdf2f8"},{range:[4,6],color:"#fce7f3"},
+        {range:[6,8],color:"#fbcfe8"},{range:[8,10],color:"#f9a8d4"}
+      ]
+    }
+  }];
+  Plotly.react(gaugeDiv,data,{margin:{t:40,b:0,l:0,r:0}});
+}
+
+/* ---------- главный циклапдейт ---------- */
+async function refresh(){
+  // данные сенсоров параллельно
+  const sensorPromises = sensors.map(s =>
+    j(`/api/data?sensor_type=${s}&tank_id=${currentTank}&limit=720`)
+  );
+  const abvPromise = j(`/api/abv?tank_id=${currentTank}`);
+  const rowsArr = await Promise.all(sensorPromises);
+  rowsArr.forEach((rows,idx)=>plotSensor(sensors[idx],rows));
+
+  const {abv, anomaly}=await abvPromise;
+  updateGauge(abv, anomaly);
+  const rec = await j(`/api/recommend?tank_id=${currentTank}&target=4.6`);
+document.getElementById("tips").innerHTML =
+  "<b>Рекомендации:</b><ul>"+rec.tips.map(t=>`<li>${t}</li>`).join("")+"</ul>";
+}
+
+/* ---------- загрузка списка танков + setInterval ---------- */
+(async function init(){
+  const tanks = await j("/api/tanks");
+  tanks.forEach(t=>{
+    const opt=document.createElement("option");
+    opt.value=t.id; opt.textContent=`${t.id} — ${t.name}`;
+    sel.appendChild(opt);
+  });
+  currentTank = Number(sel.value);
+  sel.addEventListener("change",()=>{currentTank=Number(sel.value); refresh();});
+  refresh();                 // первый рендер
+  setInterval(refresh,60_000); // далее каждую минуту
+})();
+</script>
+</body>
+</html>
