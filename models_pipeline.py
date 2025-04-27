@@ -1,51 +1,22 @@
-"""
- Enhanced pipeline for preprocessing, *early* ABV forecasting and anomaly
- detection in the Brew‑IoT prototype.
-
- Why this revision?
- ------------------
- In the previous version the regression could be replaced by the trivial
- formula `ABV = 131.25 × (SG₀ − SG_final)`, because we used the *final* SG as
- both a feature and indirect label.  Now the model is forced to learn the
- relationship between the **first N hours** of fermentation and the eventual
- alcohol content, when the terminal density is still unknown.
-
- Key changes
- ~~~~~~~~~~~
- • **Early‑window features only** – default *early_hours = 12* (configurable)
-   – SG statistics, CO₂ evolution, temperature profile and pH drop *within the
-     first N h*.
-   – *No* access to SG after the cutoff → the analytical formula cannot be
-     applied at prediction time.
- • **Target**  (`abv_final`) is still derived from SG *after 72 h* → supervised
-   training signal remains correct.
- • Added CO₂‑based and pressure‑based features to increase predictive power.
- • The public API `predict_abv(tank_id, early_hours)` can be wired into
-   FastAPI later.
-
- The module remains self‑contained; it reuses `main.py` for DB access and
- synthetic data generation.
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import timezone
 from typing import Dict, List, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
-from xgboost import XGBRegressor
 from sklearn.metrics import mean_absolute_error
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold
+from xgboost import XGBRegressor
+from scipy.optimize import curve_fit
 from sqlmodel import Session, select
 
-# ---------------------------------------------------------------------------
-# Import Brew‑IoT objects (DB models & generator)
-# ---------------------------------------------------------------------------
-from main import (
+
+from data_backend import (
+    SQLModel,
     SensorType,
     Measurement,
     Tank,
@@ -54,31 +25,51 @@ from main import (
 )
 
 # ---------------------------------------------------------------------------
-# 1. Synthetic‑batch generation utilities (unchanged)
+# 1. Synthetic‑batch generation utilities
 # ---------------------------------------------------------------------------
 
 
-def ensure_n_runs(n_runs: int = 100, duration_h: int = 72) -> None:
-    """Populate the database with *n_runs* distinct fermentation profiles.
+def ensure_n_runs(
+    n_runs: int = 100,
+    duration_h: int = 72,
+    noise_scale: float = 1.0,
+) -> None:
+    """Populate the database with *n_runs* fermentation profiles.
 
-    The existing DB may already contain 1 or more runs (tanks).  We simply add
-    new Tank IDs until the desired count is reached.  To induce variety we
-    randomly perturb the logistic‑curve parameters each time.
+    Parameters
+    ----------
+    n_runs : int, default 100
+        How many distinct tanks should be present in the DB in total.
+    duration_h : int, default 72
+        Length of each synthetic run (hours).
+    noise_scale : float, default 1.0
+        Multiplier applied to the stochastic terms inside
+        ``generate_synthetic_data()``.  Use values < 1 to inspect model
+        behaviour on cleaner data.
     """
 
-    with Session(engine) as session:
-        # Highest current tank id (start at 0 if none)
-        max_id = (
-            session.exec(select(Tank.id).order_by(Tank.id.desc()).limit(1)).first()
-            or 0
-        )
+    SQLModel.metadata.create_all(engine, checkfirst=True)
 
-    for i in range(max_id + 1, n_runs + 1):
+    with Session(engine) as session:
+        existing = set(session.exec(select(Tank.id)).all())
+        for tid in range(1, n_runs + 1):
+            if tid not in existing:
+                session.add(Tank(id=tid, name=f"Simulated tank #{tid}"))
+        session.commit()
+
+    with Session(engine) as session:
+        existing = set(session.exec(select(Tank.id)).all())
+        for tid in range(1, n_runs + 1):
+            if tid not in existing:
+                session.add(Tank(id=tid, name=f"Simulated tank #{tid}"))
+        session.commit()
+
+    for i in range(1, n_runs + 1):
         # Draw random parameters within realistic brewing bounds
-        s0 = np.random.uniform(1.045, 1.070)  # initial SG
-        dsg = np.random.uniform(0.035, 0.055)  # SG drop
-        k = np.random.uniform(0.15, 0.25)  # curve steepness
-        t0 = np.random.uniform(20, 28)  # midpoint in hours
+        s0 = np.random.uniform(1.045, 1.070)
+        dsg = np.random.uniform(0.035, 0.055)
+        k = np.random.uniform(0.15, 0.25)
+        t0 = np.random.uniform(20, 28)
 
         generate_synthetic_data(
             duration_h=duration_h,
@@ -87,6 +78,7 @@ def ensure_n_runs(n_runs: int = 100, duration_h: int = 72) -> None:
             dsg=dsg,
             k=k,
             t0=t0,
+            noise_scale=noise_scale,  # <‑‑ new
         )
 
 
@@ -94,9 +86,8 @@ def ensure_n_runs(n_runs: int = 100, duration_h: int = 72) -> None:
 # 2. Data extraction & preprocessing helpers
 # ---------------------------------------------------------------------------
 
-
 _ONE_MIN = pd.Timedelta(minutes=1)
-_ROLL = 15  # smoothing window (15 min)
+_ROLL = 15  # smoothing window (15 min)
 
 
 def _pivot_measurements(rows: List[Measurement]) -> pd.DataFrame:
@@ -133,18 +124,24 @@ def _pivot_measurements(rows: List[Measurement]) -> pd.DataFrame:
     df["temp_smooth"] = df[SensorType.temperature].rolling(_ROLL, min_periods=1).mean()
     df["co2_smooth"] = df[SensorType.co2].rolling(_ROLL, min_periods=1).mean()
 
-    # Gradients (per hour)
+    # First derivatives (per hour)
     dt_h = _ONE_MIN / pd.Timedelta(hours=1)  # = 1/60
     df["dsg_dt"] = np.gradient(df["sg_smooth"]) / dt_h
     df["dT_dt"] = np.gradient(df["temp_smooth"]) / dt_h
     df["dCO2_dt"] = np.gradient(df["co2_smooth"]) / dt_h
 
+    # Second derivatives ---------------------------------------------------
+    df["d2sg_dt2"] = np.gradient(df["dsg_dt"]) / dt_h
+    df["d2T_dt2"] = np.gradient(df["dT_dt"]) / dt_h
+
     return df
 
 
 # ---------------------------------------------------------------------------
-# 3. Feature engineering (EARLY‑WINDOW ONLY!)
+# 3. Feature engineering helpers
 # ---------------------------------------------------------------------------
+
+_DEF_EARLY_HOURS = 36  # default cutoff for features
 
 
 def _window_stats(series: pd.Series, minutes: int) -> Tuple[float, float]:
@@ -152,46 +149,93 @@ def _window_stats(series: pd.Series, minutes: int) -> Tuple[float, float]:
     return float(sl.mean()), float(sl.std())
 
 
-_DEF_EARLY_HOURS = 50  # default cutoff for features
+# -- logistic fit ----------------------------------------------------------
+
+def _fit_logistic_early(times_h: np.ndarray, sg: np.ndarray) -> Tuple[float, float]:
+    """Fit *k* and *t₀* of the logistic SG curve using early data only.
+
+    Returns *(k, t0)*.  Any optimisation error results in ``(nan, nan)`` so the
+    downstream model can learn to ignore missing fits if needed.
+    """
+
+    def logistic(t, s0, dsg, k, t0):
+        return s0 - dsg / (1 + np.exp(-k * (t - t0)))
+
+    try:
+        p0 = [sg[0], 0.04, 0.2, times_h[len(times_h) // 2]]
+        bounds = ([1.030, 0.02, 0.05, 0.0], [1.080, 0.08, 1.0, times_h[-1]])
+        popt, _ = curve_fit(logistic, times_h, sg, p0=p0, bounds=bounds, maxfev=10000)
+        return float(popt[2]), float(popt[3])  # k, t0
+    except Exception:
+        return float("nan"), float("nan")
 
 
-def build_feature_vector(df: pd.DataFrame, early_hours: int = _DEF_EARLY_HOURS) -> Dict[str, float]:
-    """Build features using **only the first *early_hours*** of fermentation."""
+# ---------------------------------------------------------------------------
+# 4. Feature engineering (EARLY‑WINDOW ONLY)
+# ---------------------------------------------------------------------------
+
+
+def build_feature_vector(
+    df: pd.DataFrame,
+    early_hours: int = _DEF_EARLY_HOURS,
+) -> Dict[str, float]:
+    """Build engineered features from **only the first *early_hours*** hours."""
 
     cutoff = early_hours * 60  # minutes
     f: Dict[str, float] = {}
 
+    # ‑‑ SG & its dynamics --------------------------------------------------
     sg0 = df["sg_smooth"].iloc[0]
-
-    # SG‑based early dynamics
     f["sg0"] = sg0
-    f["sg_drop_%dh" % early_hours] = sg0 - df["sg_smooth"].iloc[cutoff - 1]
-    f["max_dsgdt_%dh" % early_hours] = df["dsg_dt"].iloc[:cutoff].min()
+    f[f"sg_drop_{early_hours}h"] = sg0 - df["sg_smooth"].iloc[cutoff - 1]
+    f[f"max_dsgdt_{early_hours}h"] = df["dsg_dt"].iloc[:cutoff].min()
 
-    # Temperature stats early vs whole early window
-    f["temp_mean_%dh" % early_hours], f["temp_std_%dh" % early_hours] = _window_stats(
+    # Second derivative (curvature)
+    f[f"min_d2sgdt2_{early_hours}h"] = df["d2sg_dt2"].iloc[:cutoff].min()
+
+    # Logistic fit parameters k & t0
+    times_h = np.arange(cutoff) / 60
+    k_fit, t0_fit = _fit_logistic_early(times_h, df["sg_smooth"].iloc[:cutoff].values)
+    f["k_fit"] = k_fit
+    f["t0_fit_h"] = t0_fit
+
+    # ‑‑ Temperature -------------------------------------------------------
+    f[f"temp_mean_{early_hours}h"], f[f"temp_std_{early_hours}h"] = _window_stats(
         df["temp_smooth"], cutoff
     )
+    f[f"temp_max_rate_{early_hours}h"] = df["dT_dt"].iloc[:cutoff].max()
+    f[f"temp_min_rate_{early_hours}h"] = df["dT_dt"].iloc[:cutoff].min()
+    f["temp_spike_count"] = (np.abs(df["dT_dt"].iloc[:cutoff]) > 0.3).sum()
 
-    # CO₂ evolution (proxy for fermentation rate)
-    f["co2_mean_%dh" % early_hours], f["co2_std_%dh" % early_hours] = _window_stats(
+    # ‑‑ CO₂ evolution -----------------------------------------------------
+    f[f"co2_mean_{early_hours}h"], f[f"co2_std_{early_hours}h"] = _window_stats(
         df["co2_smooth"], cutoff
     )
-    f["max_dCO2dt_%dh" % early_hours] = df["dCO2_dt"].iloc[:cutoff].max()
+    f[f"max_dCO2dt_{early_hours}h"] = df["dCO2_dt"].iloc[:cutoff].max()
 
-    # pH change early
-    f["pH0"] = df[SensorType.ph].iloc[0]
-    f["pH_drop_%dh" % early_hours] = f["pH0"] - df[SensorType.ph].iloc[cutoff - 1]
+    # Integrals over 12 h blocks
+    for start in range(0, early_hours, 12):
+        end = min(start + 12, early_hours)
+        area = df["co2_smooth"].iloc[start * 60 : end * 60].sum() / 60  # ppm·h
+        f[f"co2_int_{start}_{end}h"] = area
+
+    # ‑‑ pH dynamics -------------------------------------------------------
+    pH0 = df[SensorType.ph].iloc[0]
+    pH_end = df[SensorType.ph].iloc[cutoff - 1]
+    f["pH0"] = pH0
+    f["pH_drop_{early_hours}h"] = pH0 - pH_end
+    f[f"pH_slope_{early_hours}h"] = (pH_end - pH0) / early_hours
+    f[f"pH_std_{early_hours}h"] = df[SensorType.ph].iloc[:cutoff].std()
 
     return f
 
 
 # ---------------------------------------------------------------------------
-# 4. Dataset assembly (label uses *final* ABV, features use early window)
+# 5. Dataset assembly
 # ---------------------------------------------------------------------------
 
-
 _ABV_FACTOR = 131.25  # standard hydrometer factor
+
 
 def assemble_dataset(early_hours: int = _DEF_EARLY_HOURS) -> Tuple[pd.DataFrame, pd.Series]:
     """Return feature matrix *X* and target *y* (final ABV)."""
@@ -226,43 +270,90 @@ def assemble_dataset(early_hours: int = _DEF_EARLY_HOURS) -> Tuple[pd.DataFrame,
 
 
 # ---------------------------------------------------------------------------
-# 5. Model training
+# 6. Model training
 # ---------------------------------------------------------------------------
 
 
-def train_models(save_dir: Path | str = "models", early_hours: int = _DEF_EARLY_HOURS) -> None:
+def train_models(
+    save_dir: Path | str = "models",
+    early_hours: int = _DEF_EARLY_HOURS,
+    cv_splits: int = 5,
+) -> None:
     save_dir = Path(save_dir)
     save_dir.mkdir(exist_ok=True)
 
     # Build dataset
     X, y = assemble_dataset(early_hours)
+    print(f"Dataset: {X.shape[0]} runs, {X.shape[1]} features → target len {len(y)}")
 
-    # Show feature/target shapes for sanity‑check
-    print(f"Dataset: {X.shape[0]} runs, {X.shape[1]} features  →  target len {len(y)}")
+    # ─── ABV regression (K‑fold CV + early stopping) ──────────────────────
+    cv = KFold(n_splits=cv_splits, shuffle=True, random_state=42)
 
-    # ABV regression -------------------------------------------------------
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
+    reg_params = dict(
+        objective="reg:squarederror",
+        random_state=42,
+        n_estimators=1000,
+        learning_rate=0.05,
+        max_depth=5,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.1,  # L1
+        reg_lambda=1.0,  # L2
+        early_stopping_rounds=50
     )
 
-    reg = XGBRegressor(objective='reg:squarederror', random_state=42)
-    reg.fit(X_train, y_train)
-    y_pred = reg.predict(X_test)
-    mae = mean_absolute_error(y_test, y_pred)
-    print(f"Early‑forecast ABV MAE (cutoff {early_hours} h) = {mae:.3f} (% v/v)")
+    fold_mae: List[float] = []
+    best_iters: List[int] = []
 
-    joblib.dump(reg, save_dir / "abv_regressor.pkl")
+    for fold, (tr_idx, val_idx) in enumerate(cv.split(X), 1):
+        X_tr, X_val = X.iloc[tr_idx], X.iloc[val_idx]
+        y_tr, y_val = y.iloc[tr_idx], y.iloc[val_idx]
 
-    # Anomaly detector -----------------------------------------------------
+        reg = XGBRegressor(**reg_params)
+        reg.fit(
+            X_tr,
+            y_tr,
+            eval_set=[(X_val, y_val)],
+            verbose=False,
+        )
+
+        y_val_pred = reg.predict(X_val, iteration_range=(0, reg.best_iteration + 1))
+        mae = mean_absolute_error(y_val, y_val_pred)
+        fold_mae.append(mae)
+        best_iters.append(reg.best_iteration)
+
+        print(
+            f"  fold {fold}: best_iter={reg.best_iteration:4d} ⋅ MAE={mae:.3f} (% v/v)"
+        )
+
+    print(
+        f"CV {cv_splits}‑fold ABV MAE = {np.mean(fold_mae):.3f} ± {np.std(fold_mae):.3f} (% v/v)"
+    )
+
+    # Refit on full data using the averaged best number of trees ------------
+    optimal_n_estimators = max(1, int(np.mean(best_iters)))
+    print(f"Retraining on full dataset (n_estimators={optimal_n_estimators}) …")
+
+    reg_params['n_estimators'] = optimal_n_estimators
+    reg_params.pop("early_stopping_rounds", None)
+
+    final_reg = XGBRegressor(
+        **reg_params
+    )
+    final_reg.fit(X, y)
+    joblib.dump(final_reg, save_dir / "abv_regressor.pkl")
+
+    # ─── Anomaly detector --------------------------------------------------
     det = IsolationForest(contamination=0.05, random_state=42)
     det.fit(X)
     joblib.dump(det, save_dir / "iso_forest.pkl")
 
+    print("✔ Models trained & saved in", save_dir)
+
 
 # ---------------------------------------------------------------------------
-# 6. Inference utilities
+# 7. Inference utilities (unchanged)
 # ---------------------------------------------------------------------------
-
 
 _REG_PATH = Path("models/abv_regressor.pkl")
 _DET_PATH = Path("models/iso_forest.pkl")
@@ -271,7 +362,7 @@ _DET_PATH = Path("models/iso_forest.pkl")
 def load_models() -> Tuple[XGBRegressor, IsolationForest]:
     if not _REG_PATH.exists() or not _DET_PATH.exists():
         raise FileNotFoundError(
-            "Models not found.  Run `train_models()` first to create them."
+            "Models not found. Run `train_models()` first to create them."
         )
     reg: XGBRegressor = joblib.load(_REG_PATH)
     det: IsolationForest = joblib.load(_DET_PATH)
@@ -280,8 +371,11 @@ def load_models() -> Tuple[XGBRegressor, IsolationForest]:
 
 # Convenience wrapper ------------------------------------------------------
 
-def predict_abv(tank_id: int, early_hours: int = _DEF_EARLY_HOURS) -> Tuple[float, bool]:
-    """Return (predicted_abv, anomaly_flag) for a given *tank_id*."""
+def predict_abv(
+    tank_id: int,
+    early_hours: int = _DEF_EARLY_HOURS,
+) -> Tuple[float, bool]:
+    """Return *(predicted_abv, anomaly_flag)* for a given *tank_id*."""
 
     with Session(engine) as session:
         rows = (
@@ -295,64 +389,43 @@ def predict_abv(tank_id: int, early_hours: int = _DEF_EARLY_HOURS) -> Tuple[floa
     df = _pivot_measurements(rows)
     reg, det = load_models()
 
-    # Build features using early window only
     X_vec = pd.DataFrame([build_feature_vector(df, early_hours)])
 
-    abv_pred = float(reg.predict(X_vec)[0])
+    abv_pred = float(
+        reg.predict(X_vec, iteration_range=(0, getattr(reg, "best_iteration", None)))
+    )
     anomaly = bool(det.predict(X_vec)[0] == -1)
 
     return abv_pred, anomaly
 
 
-# ---------------------------------------------------------------------------
-# 7. Recommendations (unchanged logic)
-# ---------------------------------------------------------------------------
-
-
-def make_recommendations(abv_pred: float, anomaly: bool) -> List[str]:
-    rec: List[str] = []
-
-    if anomaly:
-        rec.append(
-            "⚠️  Sensor readings look unusual (anomaly detected).  Check fittings, sensors, and ensure no air leaks."
-        )
-
-    if abv_pred < 4.0:
-        rec.append(
-            "Predicted final ABV is low.  Consider increasing wort temperature by 0.5–1 °C in the first 24 h or pitch more yeast."
-        )
-    elif abv_pred > 6.5:
-        rec.append(
-            "High ABV forecast.  Ensure yeast nutrients are sufficient and plan for additional conditioning time."
-        )
-    else:
-        rec.append(
-            "ABV forecast is within the typical range.  Maintain temperature profile and monitor SG decline."
-        )
-
-    return rec
-
-
-# ---------------------------------------------------------------------------
-# 8. CLI entry‑point for quick experimentation
-# ---------------------------------------------------------------------------
-
-
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="Train Brew‑IoT early‑forecast models")
-    ap.add_argument(
-        "--generate", action="store_true", help="Generate synthetic runs before training"
+    ap = argparse.ArgumentParser(
+        description="Train Brew‑IoT early‑forecast models (improved version)"
     )
-    ap.add_argument("--runs", type=int, default=200, help="Number of synthetic runs to ensure")
-    ap.add_argument("--duration", type=int, default=72, help="Duration of each run in hours")
-    ap.add_argument("--early", type=int, default=_DEF_EARLY_HOURS, help="Cutoff in hours for early features")
+    ap.add_argument(
+        "--generate",
+        action="store_true",
+        help="Generate synthetic runs before training",
+    )
+    ap.add_argument("--runs", type=int, default=50, help="Number of synthetic runs")
+    ap.add_argument("--duration", type=int, default=72, help="Duration of each run, h")
+    ap.add_argument(
+        "--noise-scale",
+        type=float,
+        default=0.3,
+        help="Scale factor for noise when generating synthetics (σ ← σ·scale)",
+    )
+    ap.add_argument(
+        "--early", type=int, default=_DEF_EARLY_HOURS, help="Early window in hours"
+    )
     args = ap.parse_args()
 
     if args.generate:
-        ensure_n_runs(args.runs, args.duration)
+        ensure_n_runs(args.runs, args.duration, args.noise_scale)
 
     train_models(early_hours=args.early)
 
-    print("✔ Training complete.  Models saved in ./models/")
+    print("✔ Training complete. Models saved in ./models/")
