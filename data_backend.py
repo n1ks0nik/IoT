@@ -38,7 +38,7 @@ class Tank(SQLModel, table=True):
 def logistic(t_h: np.ndarray,
             *,
             s0: float = 1.050,
-            dsg: float = 0.04,
+            dsg: float = 0.035,
             k: float = 0.2,
             t0: float = 24) -> np.ndarray:
     """Logistic curve for specific gravity."""
@@ -50,7 +50,7 @@ def generate_synthetic_data(
     duration_h: int = 72,
     tank_id: int = 1,
     s0: float = 1.050,
-    dsg: float = 0.04,
+    dsg: float = 0.035,
     k: float = 0.2,
     t0: float = 24,
     noise_scale: float = 1.0,

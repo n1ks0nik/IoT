@@ -67,7 +67,7 @@ def ensure_n_runs(
     for i in range(1, n_runs + 1):
         # Draw random parameters within realistic brewing bounds
         s0 = np.random.uniform(1.045, 1.070)
-        dsg = np.random.uniform(0.035, 0.055)
+        dsg = np.random.uniform(0.027, 0.04)
         k = np.random.uniform(0.15, 0.25)
         t0 = np.random.uniform(20, 28)
 
@@ -413,12 +413,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Generate synthetic runs before training",
     )
-    ap.add_argument("--runs", type=int, default=50, help="Number of synthetic runs")
+    ap.add_argument("--runs", type=int, default=40, help="Number of synthetic runs")
     ap.add_argument("--duration", type=int, default=72, help="Duration of each run, h")
     ap.add_argument(
         "--noise-scale",
         type=float,
-        default=0.3,
+        default=0.6,
         help="Scale factor for noise when generating synthetics (σ ← σ·scale)",
     )
     ap.add_argument(
