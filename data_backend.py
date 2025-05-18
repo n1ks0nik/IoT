@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 DATABASE_URL = "sqlite:///fermentation1.db"
-engine = create_engine(DATABASE_URL, echo=False)
+engine = create_engine(DATABASE_URL, echo=True)
 
 
 class SensorType(str, Enum):
@@ -124,7 +124,7 @@ def generate_synthetic_data(
             )
             session.commit()
 
-    insert_array(idx_1min, temperature, SensorType.temperature)
+    # insert_array(idx_1min, temperature, SensorType.temperature)
     insert_array(idx_5min, sg, SensorType.sg)
     insert_array(idx_1h, pH, SensorType.ph)
     insert_array(idx_1min, co2, SensorType.co2)
