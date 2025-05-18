@@ -126,7 +126,3 @@ async def ingest_measurement(payload: SensorPayload):
         session.add(m)
         session.commit()
     return {"status": "ok"}
-
-import os
-print(f"Working dir = {os.getcwd()}")
-print(f"DB file    = {os.path.abspath('fermentation1.db')}")
